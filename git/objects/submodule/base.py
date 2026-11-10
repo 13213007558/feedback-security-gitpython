@@ -759,7 +759,11 @@ class Submodule(IndexObject, TraversableIterableObj):
                     )
                     # ===============================
                     if not dry_run:
-                        remote.fetch(progress=progress)
+                        remote.fetch(
+                            progress=progress,
+                            allow_unsafe_protocols=allow_unsafe_protocols,
+                            allow_unsafe_options=allow_unsafe_options,
+                        )
                     # END handle dry-run
                     # ===============================
                     if i == len_rmts - 1:
@@ -967,6 +971,10 @@ class Submodule(IndexObject, TraversableIterableObj):
                         dry_run=dry_run,
                         force=force,
                         keep_going=keep_going,
+                        env=env,
+                        clone_multi_options=clone_multi_options,
+                        allow_unsafe_options=allow_unsafe_options,
+                        allow_unsafe_protocols=allow_unsafe_protocols,
                     )
                 # END handle recursive update
             # END handle dry run

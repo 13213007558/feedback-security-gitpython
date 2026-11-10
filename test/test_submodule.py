@@ -1370,3 +1370,583 @@ class TestSubmodule(TestBase):
 
         has_module = any(sm.name == "module" for sm in cloned_repo.submodules)
         assert has_module, "Relative submodule was not updated properly"
+
+
+class _StopAtSubcommand(Exception):
+    """Raised by the command recorder when the captured subcommand would otherwise
+    contact a (simulated) dangerous helper. It replaces the real git invocation so
+    that the tests never execute an ``ext::`` helper or ``--upload-pack`` command."""
+
+
+class _CommandRecorder:
+    """Record every git subcommand actually launched and optionally short-circuit the
+    ones matching a predicate.
+
+    Only :meth:`Git.execute` is patched, so all of GitPython's own bookkeeping keeps
+    running against real local repositories, while no recorded dangerous command is
+    handed to a git process. Each entry stores the full argument vector (including the
+    resolved URL and the safety-relevant options) plus the keyword arguments.
+    """
+
+    def __init__(self, block_predicate=None):
+        self.calls = []
+        self.blocked = []
+        self._block_predicate = block_predicate or (lambda command: False)
+        self._real_execute = Git.execute
+
+        def wrapper(git_instance, command, *args, **kwargs):
+            vector = list(command)
+            self.calls.append((vector, dict(kwargs)))
+            if self._block_predicate(vector):
+                self.blocked.append(vector)
+                raise _StopAtSubcommand(vector)
+            return self._real_execute(git_instance, command, *args, **kwargs)
+
+        self._wrapper = wrapper
+
+    @contextlib.contextmanager
+    def installed(self):
+        with mock.patch.object(Git, "execute", self._wrapper):
+            yield self
+
+    def vectors_for(self, subcommand):
+        return [vector for vector, _kwargs in self.calls if subcommand in vector]
+
+    def clone_vectors(self):
+        return self.vectors_for("clone")
+
+    def fetch_vectors(self):
+        return self.vectors_for("fetch")
+
+    def remote_add_vectors(self):
+        return [vector for vector, _kwargs in self.calls if vector[:2] == ["git", "remote"] and "add" in vector]
+
+
+class TestSubmoduleUnsafeRecursive(TestBase):
+    """Call-chain tests for the unsafe protocol/option gates during recursive
+    submodule operations.
+
+    Everything runs against local, on-disk repositories created inside the temporary
+    directory. Dangerous helpers are never executed: the command recorder intercepts
+    the subcommands that would carry an ``ext::`` URL or an unsafe option, while all
+    ordinary git commands still run for real.
+    """
+
+    unsafe_url = "ext::sh -c touch% /tmp/gitpython_unsafe_recursive_pwn"
+    unsafe_upload_pack = "--upload-pack=touch /tmp/gitpython_unsafe_recursive_pwn"
+
+    # { fixtures / small helpers
+
+    @staticmethod
+    def _commit_file(repo, filename, content="data"):
+        with open(osp.join(repo.working_tree_dir, filename), "w") as fh:
+            fh.write(content)
+        repo.index.add([filename])
+        return repo.index.commit("commit %s" % filename)
+
+    @staticmethod
+    def _bare_clone(repo, path):
+        return repo.clone(path, bare=True).git_dir
+
+    @staticmethod
+    def _register_only(repo, name, path, url, branch):
+        """Create a .gitmodules/index entry for a submodule without cloning it.
+
+        This mirrors a submodule that has not been initialised yet, so calling
+        :meth:`Submodule.update` has to take the clone branch.
+        """
+        submodule = Submodule(
+            repo,
+            b"\0" * 20,
+            name=name,
+            path=path,
+            url=url,
+            branch_path=git.Head.to_full_path(branch),
+        )
+        with submodule.config_writer() as writer:
+            writer.set_value("url", url)
+            writer.set_value("path", path)
+        return submodule
+
+    @staticmethod
+    def _snapshot(repo, *relative_paths):
+        """Capture (path-exists, raw-bytes) pairs for config files / work trees."""
+        base = repo.working_tree_dir
+        result = {}
+        for rel in relative_paths:
+            abs_path = osp.join(base, rel)
+            if osp.isdir(abs_path):
+                result[rel] = ("dir", sorted(os.listdir(abs_path)))
+            elif osp.isfile(abs_path):
+                with open(abs_path, "rb") as fh:
+                    result[rel] = ("file", fh.read())
+            else:
+                result[rel] = ("missing", None)
+        # Also record the .git/modules directory (an empty one is equivalent to none,
+        # because _clone_repo creates the parent directory before the safety gate).
+        modules_dir = osp.join(repo.git_dir, "modules")
+        modules_content = sorted(os.listdir(modules_dir)) if osp.isdir(modules_dir) else None
+        result["<.git/modules>"] = ("dir", modules_content or None)
+        return result
+
+    @staticmethod
+    def _remote_urls(repo):
+        return sorted(remote.url for remote in repo.remotes)
+
+    @staticmethod
+    def _contains(vector, needle):
+        return any(needle in str(part) for part in vector)
+
+    @contextlib.contextmanager
+    def _spy_clone_repo(self, stop_on_unsafe=True):
+        """Intercept :meth:`Submodule._clone_repo` at every nesting level.
+
+        Each recorded entry captures the *resolved* URL and the two safety switches as
+        they actually arrive at the clone boundary. Clones whose URL contains a remote
+        helper syntax are short-circuited (they never reach a git process); ordinary
+        local clones still run for real.
+        """
+        seen = []
+        real_clone_repo = Submodule._clone_repo.__func__
+
+        def spy_clone_repo(cls, repo, url, path, name, **kwargs):
+            allow_unsafe_options = kwargs.pop("allow_unsafe_options", False)
+            allow_unsafe_protocols = kwargs.pop("allow_unsafe_protocols", False)
+            seen.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "path": str(path),
+                    "allow_unsafe_protocols": allow_unsafe_protocols,
+                    "allow_unsafe_options": allow_unsafe_options,
+                    "multi_options": kwargs.get("multi_options"),
+                }
+            )
+            if stop_on_unsafe and "::" in url:
+                raise _StopAtSubcommand(url)
+            return real_clone_repo(
+                cls,
+                repo,
+                url,
+                path,
+                name,
+                allow_unsafe_options=allow_unsafe_options,
+                allow_unsafe_protocols=allow_unsafe_protocols,
+                **kwargs,
+            )
+
+        with mock.patch.object(Submodule, "_clone_repo", new=classmethod(spy_clone_repo)):
+            yield seen
+
+    def _make_two_level_repos(self, rwdir, inner_url=None, relative_inner_url=False):
+        """Build leaf -> mid -> top repositories and a fresh clone of top.
+
+        The leaf is always added to the middle for real so that a valid submodule
+        gitlink exists in the tree. Its recorded URL is then rewritten in a second
+        commit (to an unsafe or relative value) without touching the gitlink, which
+        is the state a recursive update has to resolve at the second nesting level.
+        """
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "leaf.txt")
+        branch = leaf.heads[0].name
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+
+        mid = git.Repo.init(osp.join(rwdir, "mid"))
+        inner = git.Submodule.add(mid, "leaf", "leaf", url=leaf_bare, branch=branch)
+        mid.index.commit("add leaf")
+
+        if relative_inner_url:
+            rewritten_url = "../leaf.git"
+        elif inner_url is not None:
+            rewritten_url = inner_url
+        else:
+            rewritten_url = leaf_bare
+        if rewritten_url != leaf_bare:
+            with inner.config_writer() as writer:
+                writer.set_value("url", rewritten_url)
+            mid.index.commit("rewrite leaf url")
+        mid_bare = self._bare_clone(mid, osp.join(rwdir, "mid.git"))
+
+        top = git.Repo.init(osp.join(rwdir, "top"))
+        git.Submodule.add(top, "mid", "mid", url=mid_bare, branch=branch)
+        top.index.commit("add mid")
+
+        clone = git.Repo.clone_from(top.working_tree_dir, osp.join(rwdir, "clone"))
+        return {"leaf": leaf, "mid": mid, "top": top, "clone": clone, "branch": branch,
+                "leaf_bare": leaf_bare, "mid_bare": mid_bare, "inner": inner}
+
+    # } fixtures / small helpers
+
+    # { new clone: default deny, explicit allow, and switch independence
+
+    @with_rw_directory
+    def test_new_clone_blocks_unsafe_url_by_default(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = self._register_only(
+            parent, "evil", "evil", self.unsafe_url, leaf.heads[0].name
+        )
+        snapshot = self._snapshot(parent, ".gitmodules")
+
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                submodule.update(init=True)
+
+        # The dangerous helper must never have been launched.
+        assert recorder.clone_vectors() == []
+        assert recorder.blocked == []
+        # No work tree, no .git/modules entry, no .gitmodules rewrite.
+        assert not osp.exists(osp.join(parent.working_tree_dir, "evil"))
+        assert not osp.isdir(osp.join(parent.git_dir, "modules", "evil"))
+        assert self._snapshot(parent, ".gitmodules") == snapshot
+
+    @with_rw_directory
+    def test_new_clone_passes_url_when_protocol_allowed(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = self._register_only(
+            parent, "evil", "evil", self.unsafe_url, leaf.heads[0].name
+        )
+
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(_StopAtSubcommand):
+                submodule.update(init=True, allow_unsafe_protocols=True)
+
+        clone_vectors = recorder.clone_vectors()
+        assert len(clone_vectors) == 1
+        assert self._contains(clone_vectors[0], self.unsafe_url)
+        assert not self._contains(clone_vectors[0], "--upload-pack")
+
+    @with_rw_directory
+    def test_new_clone_blocks_unsafe_option_by_default(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = self._register_only(
+            parent, "leaf", "leaf", leaf_bare, leaf.heads[0].name
+        )
+        snapshot = self._snapshot(parent, ".gitmodules")
+
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(UnsafeOptionError):
+                submodule.update(
+                    init=True, clone_multi_options=[self.unsafe_upload_pack]
+                )
+
+        assert recorder.clone_vectors() == []
+        assert not osp.exists(osp.join(parent.working_tree_dir, "leaf"))
+        assert not osp.isdir(osp.join(parent.git_dir, "modules", "leaf"))
+        assert self._snapshot(parent, ".gitmodules") == snapshot
+
+    @with_rw_directory
+    def test_new_clone_allows_only_chosen_option_switch(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+
+        # Allowing the option switch must not silently allow an unsafe protocol.
+        protocol_submodule = self._register_only(
+            parent, "p", "p", self.unsafe_url, leaf.heads[0].name
+        )
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                protocol_submodule.update(
+                    init=True,
+                    clone_multi_options=[self.unsafe_upload_pack],
+                    allow_unsafe_options=True,
+                )
+        assert recorder.clone_vectors() == []
+
+        # And allowing the protocol switch must not silently allow unsafe options.
+        option_submodule = self._register_only(
+            parent, "o", "o", leaf_bare, leaf.heads[0].name
+        )
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(UnsafeOptionError):
+                option_submodule.update(
+                    init=True,
+                    clone_multi_options=[self.unsafe_upload_pack],
+                    allow_unsafe_protocols=True,
+                )
+        assert recorder.clone_vectors() == []
+
+        # When the matching switch is opened, the option really reaches the subcommand
+        # while no protocol restriction is relaxed (plain local URL here).
+        allowed_submodule = self._register_only(
+            parent, "a", "a", leaf_bare, leaf.heads[0].name
+        )
+        recorder = _CommandRecorder(lambda vector: "clone" in vector)
+        with recorder.installed():
+            with pytest.raises(_StopAtSubcommand):
+                allowed_submodule.update(
+                    init=True,
+                    clone_multi_options=[self.unsafe_upload_pack],
+                    allow_unsafe_options=True,
+                )
+        clone_vectors = recorder.clone_vectors()
+        assert len(clone_vectors) == 1
+        assert self._contains(clone_vectors[0], "--upload-pack")
+        assert not self._contains(clone_vectors[0], "ext::")
+
+    # } new clone
+
+    # { existing module: fetch path
+
+    @with_rw_directory
+    def test_existing_module_fetch_inherits_switches(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        branch = leaf.heads[0].name
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = git.Submodule.add(parent, "leaf", "leaf", url=leaf_bare, branch=branch)
+        parent.index.commit("add leaf")
+        submodule.update(init=True)
+        module = submodule.module()
+        before_urls = self._remote_urls(module)
+
+        # Spy on Remote.fetch: the update loop must forward both switches verbatim.
+        seen = {}
+        real_fetch = git.Remote.fetch
+
+        def spy_fetch(remote, *args, **kwargs):
+            seen.update(kwargs)
+            return real_fetch(remote, *args, **kwargs)
+
+        with mock.patch.object(git.Remote, "fetch", spy_fetch):
+            submodule.update(
+                allow_unsafe_protocols=True, allow_unsafe_options=True
+            )
+        assert seen.get("allow_unsafe_protocols") is True
+        assert seen.get("allow_unsafe_options") is True
+        assert self._remote_urls(module) == before_urls
+        assert osp.isdir(module.working_tree_dir)
+
+    @with_rw_directory
+    def test_existing_module_fetch_default_deny_keeps_config_and_tree(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        branch = leaf.heads[0].name
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = git.Submodule.add(parent, "leaf", "leaf", url=leaf_bare, branch=branch)
+        parent.index.commit("add leaf")
+        submodule.update(init=True)
+        module = submodule.module()
+        work_tree = module.working_tree_dir
+        head_hexsha = module.head.commit.hexsha
+
+        # Tamper with the already-initialised module's .git/config directly, bypassing
+        # the Remote.set_url Python gate, to model a dangerous URL present on disk.
+        with module.config_writer() as writer:
+            writer.set_value('remote "origin"', "url", self.unsafe_url)
+        assert self._remote_urls(module) == [self.unsafe_url]
+
+        recorder = _CommandRecorder(lambda vector: "fetch" in vector)
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                submodule.update()
+
+        # The fetch helper never launched; the working tree and checked-out commit are
+        # untouched and the (tampered) config is not rewritten by the failed update.
+        assert recorder.fetch_vectors() == []
+        assert recorder.blocked == []
+        assert osp.isdir(work_tree)
+        assert module.head.commit.hexsha == head_hexsha
+        assert self._remote_urls(module) == [self.unsafe_url]
+
+    # } existing module fetch
+
+    # { .gitmodules URL change
+
+    @with_rw_directory
+    def test_url_change_blocks_unsafe_remote_by_default(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        branch = leaf.heads[0].name
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = git.Submodule.add(parent, "leaf", "leaf", url=leaf_bare, branch=branch)
+        parent.index.commit("add leaf")
+        submodule.update(init=True)
+        module = submodule.module()
+        before_urls = self._remote_urls(module)
+
+        with submodule.config_writer() as writer:
+            writer.set_value("url", self.unsafe_url)
+        parent.index.commit("change url to unsafe")
+        # Snapshot the (intentionally) rewritten .gitmodules; the failed update must
+        # not corrupt it further.
+        snapshot = self._snapshot(parent, ".gitmodules")
+
+        recorder = _CommandRecorder()
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                parent.submodule_update(recursive=False)
+
+        # No remote-add/fetch carrying the unsafe URL may have been launched.
+        assert not any(self._contains(vector, "ext::") for vector in recorder.remote_add_vectors())
+        assert not any(self._contains(vector, "ext::") for vector in recorder.fetch_vectors())
+        # Existing remote configuration, the checked-out tree and .gitmodules stay intact.
+        assert self._remote_urls(module) == before_urls
+        assert osp.isdir(module.working_tree_dir)
+        assert self._snapshot(parent, ".gitmodules") == snapshot
+
+    @with_rw_directory
+    def test_url_change_propagates_protocol_switch_only(self, rwdir):
+        leaf = git.Repo.init(osp.join(rwdir, "leaf"))
+        self._commit_file(leaf, "f.txt")
+        branch = leaf.heads[0].name
+        leaf_bare = self._bare_clone(leaf, osp.join(rwdir, "leaf.git"))
+        parent = git.Repo.init(osp.join(rwdir, "parent"))
+        submodule = git.Submodule.add(parent, "leaf", "leaf", url=leaf_bare, branch=branch)
+        parent.index.commit("add leaf")
+        submodule.update(init=True)
+
+        with submodule.config_writer() as writer:
+            writer.set_value("url", self.unsafe_url)
+        parent.index.commit("change url to unsafe")
+
+        recorder = _CommandRecorder(
+            lambda vector: ("remote" in vector and "add" in vector) or "fetch" in vector
+        )
+        with recorder.installed():
+            with pytest.raises(_StopAtSubcommand):
+                parent.submodule_update(
+                    recursive=False, allow_unsafe_protocols=True
+                )
+
+        add_vectors = recorder.remote_add_vectors()
+        assert len(add_vectors) == 1
+        assert self._contains(add_vectors[0], self.unsafe_url)
+        # Protocol switch only: no unsafe option is smuggled into any subcommand.
+        for vector, _kwargs in recorder.calls:
+            assert not self._contains(vector, "--upload-pack")
+
+    # } .gitmodules URL change
+
+    # { relative URL resolution
+
+    @with_rw_directory
+    @_patch_git_config("protocol.file.allow", "always")
+    def test_relative_url_resolved_before_clone(self, rwdir):
+        repos = self._make_two_level_repos(rwdir, relative_inner_url=True)
+        clone = repos["clone"]
+        leaf_bare = repos["leaf_bare"]
+
+        # The middle clones for real; only the leaf clone is intercepted so we can
+        # inspect the URL the recursion resolved for the second level.
+        with self._spy_clone_repo(stop_on_unsafe=False) as seen:
+            clone.submodule_update(recursive=True)
+
+        leaf_calls = [call for call in seen if call["name"].endswith("leaf")]
+        assert len(leaf_calls) == 1
+        resolved = leaf_calls[0]["url"]
+        # The relative "../leaf.git" must be resolved to an absolute local URL before
+        # it ever reaches the clone subcommand.
+        assert not str(resolved).startswith("..")
+        assert osp.realpath(resolved) == osp.realpath(leaf_bare)
+        assert osp.isdir(osp.join(clone.working_tree_dir, "mid", "leaf"))
+
+    @with_rw_directory
+    @_patch_git_config("protocol.file.allow", "always")
+    def test_relative_unsafe_url_blocked_at_every_level(self, rwdir):
+        # A relative-looking prefix that still carries the unsafe helper syntax.
+        nested_unsafe = "../" + self.unsafe_url
+        repos = self._make_two_level_repos(rwdir, inner_url=nested_unsafe)
+        clone = repos["clone"]
+
+        # Record only: the safety gate must reject the leaf clone before any git
+        # process is launched, while the safe middle clone is still allowed to run.
+        recorder = _CommandRecorder()
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                clone.submodule_update(recursive=True)
+
+        assert not any(self._contains(vector, "ext::") for vector in recorder.clone_vectors())
+        assert not osp.exists(osp.join(clone.working_tree_dir, "mid", "leaf"))
+        assert not osp.isdir(osp.join(clone.git_dir, "modules", "mid", "modules", "leaf"))
+
+    # } relative URL resolution
+
+    # { two-level nesting: inherited constraints
+
+    @with_rw_directory
+    def test_nested_update_blocks_unsafe_url_at_second_level_by_default(self, rwdir):
+        repos = self._make_two_level_repos(rwdir, inner_url=self.unsafe_url)
+        clone = repos["clone"]
+
+        # Record only: the gate raises on the leaf URL before execute, and the safe
+        # middle clone still runs so the recursion genuinely reaches the second level.
+        recorder = _CommandRecorder()
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                clone.submodule_update(recursive=True)
+
+        # The middle level may clone, but the leaf clone carrying ext:: never launches.
+        assert not any(self._contains(vector, "ext::") for vector in recorder.clone_vectors())
+        assert not osp.exists(osp.join(clone.working_tree_dir, "mid", "leaf"))
+        assert not osp.isdir(osp.join(clone.git_dir, "modules", "mid", "modules", "leaf"))
+
+    @with_rw_directory
+    def test_nested_update_inherits_protocol_switch_to_second_level(self, rwdir):
+        repos = self._make_two_level_repos(rwdir, inner_url=self.unsafe_url)
+        clone = repos["clone"]
+
+        with self._spy_clone_repo() as seen:
+            with pytest.raises(_StopAtSubcommand):
+                clone.submodule_update(
+                    recursive=True, allow_unsafe_protocols=True
+                )
+
+        leaf_calls = [call for call in seen if call["name"].endswith("leaf")]
+        assert len(leaf_calls) == 1
+        assert self._contains([leaf_calls[0]["url"]], "ext::")
+        # The protocol switch reached the leaf clone and the option switch stayed shut.
+        assert leaf_calls[0]["allow_unsafe_protocols"] is True
+        assert leaf_calls[0]["allow_unsafe_options"] is False
+        # No unsafe option is smuggled into the clone options.
+        assert all(call["multi_options"] is None for call in seen)
+
+    @with_rw_directory
+    def test_nested_update_inherits_switches_independently(self, rwdir):
+        repos = self._make_two_level_repos(rwdir, inner_url=self.unsafe_url)
+        top_path = repos["top"].working_tree_dir
+
+        def fresh_clone(suffix):
+            return git.Repo.clone_from(top_path, osp.join(rwdir, suffix))
+
+        # Phase 1: open only the option switch. The protocol gate must stay armed at
+        # the second-level leaf clone, so no ext:: helper is ever launched.
+        recorder = _CommandRecorder()
+        with recorder.installed():
+            with pytest.raises(UnsafeProtocolError):
+                fresh_clone("clone-options").submodule_update(
+                    recursive=True, allow_unsafe_options=True
+                )
+        assert not any(self._contains(vector, "ext::") for vector in recorder.clone_vectors())
+
+        # Phase 2: open only the protocol switch. The switch must be inherited down to
+        # the leaf clone while the option switch stays closed. A fresh clone keeps the
+        # deliberately failed first run from leaving partial state behind.
+        with self._spy_clone_repo() as seen:
+            with pytest.raises(_StopAtSubcommand):
+                fresh_clone("clone-protocols").submodule_update(
+                    recursive=True, allow_unsafe_protocols=True
+                )
+        leaf_calls = [call for call in seen if call["name"].endswith("leaf")]
+        assert len(leaf_calls) == 1
+        assert leaf_calls[0]["allow_unsafe_protocols"] is True
+        assert leaf_calls[0]["allow_unsafe_options"] is False
+        assert "::" in leaf_calls[0]["url"]
+
+    # } two-level nesting

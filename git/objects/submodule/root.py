@@ -87,6 +87,8 @@ class RootModule(Submodule):
         dry_run: bool = False,
         force_reset: bool = False,
         keep_going: bool = False,
+        allow_unsafe_protocols: bool = False,
+        allow_unsafe_options: bool = False,
     ) -> "RootModule":
         """Update the submodules of this repository to the current HEAD commit.
 
@@ -145,6 +147,15 @@ class RootModule(Submodule):
             subsequent/inherited errors you wouldn't see otherwise.
             In conjunction with `dry_run`, this can be useful to anticipate all errors
             when updating submodules.
+
+        :param allow_unsafe_protocols:
+            Allow unsafe protocols to be used, like ``ext``. The setting is propagated
+            to every submodule update as well as to the nested :class:`RootModule`
+            updates, so child operations inherit the caller's protocol restrictions.
+
+        :param allow_unsafe_options:
+            Allow unsafe options to be used, like ``--upload-pack``. The setting is
+            propagated the same way as `allow_unsafe_protocols`.
 
         :return:
             self
@@ -272,8 +283,14 @@ class RootModule(Submodule):
 
                             if not dry_run:
                                 assert nn not in [r.name for r in rmts]
-                                smr = smm.create_remote(nn, sm.url)
-                                smr.fetch(progress=progress)
+                                smr = smm.create_remote(
+                                    nn, sm.url, allow_unsafe_protocols=allow_unsafe_protocols
+                                )
+                                smr.fetch(
+                                    progress=progress,
+                                    allow_unsafe_protocols=allow_unsafe_protocols,
+                                    allow_unsafe_options=allow_unsafe_options,
+                                )
 
                                 # If we have a tracking branch, it should be available
                                 # in the new remote as well.
@@ -381,7 +398,11 @@ class RootModule(Submodule):
                             # As the branch might not exist yet, we will have to fetch
                             # all remotes to be sure...
                             for remote in smmr:
-                                remote.fetch(progress=progress)
+                                remote.fetch(
+                                    progress=progress,
+                                    allow_unsafe_protocols=allow_unsafe_protocols,
+                                    allow_unsafe_options=allow_unsafe_options,
+                                )
                             # END for each remote
 
                             try:
@@ -432,6 +453,8 @@ class RootModule(Submodule):
                 dry_run=dry_run,
                 force=force_reset,
                 keep_going=keep_going,
+                allow_unsafe_protocols=allow_unsafe_protocols,
+                allow_unsafe_options=allow_unsafe_options,
             )
 
             # Update recursively depth first - question is which inconsistent state will
@@ -450,6 +473,8 @@ class RootModule(Submodule):
                         dry_run=dry_run,
                         force_reset=force_reset,
                         keep_going=keep_going,
+                        allow_unsafe_protocols=allow_unsafe_protocols,
+                        allow_unsafe_options=allow_unsafe_options,
                     )
                 # END handle dry_run
             # END handle recursive

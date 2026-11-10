@@ -1063,6 +1063,9 @@ class Remote(LazyMixin, IterableObj):
             args = [refspec]
 
         if not allow_unsafe_protocols:
+            # The remote itself is passed to ``git fetch``, so its configured URL is
+            # the transport that will actually be dialed and must be gated as well.
+            Git.check_unsafe_protocols(self.url)
             for ref in args:
                 if ref:
                     Git.check_unsafe_protocols(ref)
@@ -1118,6 +1121,8 @@ class Remote(LazyMixin, IterableObj):
 
         refspec = Git._unpack_args(refspec or [])
         if not allow_unsafe_protocols:
+            # The remote itself is passed to ``git pull``, so gate its configured URL.
+            Git.check_unsafe_protocols(self.url)
             for ref in refspec:
                 Git.check_unsafe_protocols(ref)
 
@@ -1191,6 +1196,8 @@ class Remote(LazyMixin, IterableObj):
 
         refspec = Git._unpack_args(refspec or [])
         if not allow_unsafe_protocols:
+            # The remote itself is passed to ``git push``, so gate its configured URL.
+            Git.check_unsafe_protocols(self.url)
             for ref in refspec:
                 Git.check_unsafe_protocols(ref)
 
