@@ -1068,7 +1068,9 @@ class Remote(LazyMixin, IterableObj):
                     Git.check_unsafe_protocols(ref)
 
         if not allow_unsafe_options:
-            Git.check_unsafe_options(options=list(kwargs.keys()), unsafe_options=self.unsafe_git_fetch_options)
+            Git.check_unsafe_options(
+                options=Git._kwarg_option_tokens(kwargs), unsafe_options=self.unsafe_git_fetch_options
+            )
 
         proc = self.repo.git.fetch(
             "--", self, *args, as_process=True, with_stdout=False, universal_newlines=True, v=verbose, **kwargs
@@ -1122,7 +1124,9 @@ class Remote(LazyMixin, IterableObj):
                 Git.check_unsafe_protocols(ref)
 
         if not allow_unsafe_options:
-            Git.check_unsafe_options(options=list(kwargs.keys()), unsafe_options=self.unsafe_git_pull_options)
+            Git.check_unsafe_options(
+                options=Git._kwarg_option_tokens(kwargs), unsafe_options=self.unsafe_git_pull_options
+            )
 
         proc = self.repo.git.pull(
             "--", self, refspec, with_stdout=False, as_process=True, universal_newlines=True, v=True, **kwargs
@@ -1195,7 +1199,9 @@ class Remote(LazyMixin, IterableObj):
                 Git.check_unsafe_protocols(ref)
 
         if not allow_unsafe_options:
-            Git.check_unsafe_options(options=list(kwargs.keys()), unsafe_options=self.unsafe_git_push_options)
+            Git.check_unsafe_options(
+                options=Git._kwarg_option_tokens(kwargs), unsafe_options=self.unsafe_git_push_options
+            )
 
         proc = self.repo.git.push(
             "--",

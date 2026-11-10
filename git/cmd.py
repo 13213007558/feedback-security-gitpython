@@ -13,6 +13,7 @@ import itertools
 import logging
 import os
 import re
+import shlex
 import signal
 import subprocess
 from subprocess import DEVNULL, PIPE, Popen
@@ -941,14 +942,61 @@ class Git(metaclass=_GitMeta):
             )
 
     @classmethod
+    def _tokenize_multi_options(cls, multi_options: Sequence[str]) -> List[str]:
+        """Split ``multi_options`` into the exact tokens passed to the git process.
+
+        A single ``multi_options`` entry may contain several options and values, which
+        are re-tokenized with :func:`shlex.split` before being handed to git. The
+        security checks must operate on those same tokens, rather than on the original
+        strings, so that an unsafe option hidden behind a safe one (or behind leading
+        whitespace) cannot slip through unchecked.
+        """
+        tokens: List[str] = []
+        for option in multi_options:
+            tokens.extend(shlex.split(option))
+        return tokens
+
+    @classmethod
+    def _kwarg_option_tokens(cls, kwargs: Mapping[str, Any]) -> List[str]:
+        """Return the option-name tokens produced from Python-style keyword arguments.
+
+        This mirrors :meth:`transform_kwargs` (including :func:`dashify`), so that the
+        check sees the option names as git will receive them. Only the option names are
+        inspected; keyword argument values are data and must never be scanned as
+        options.
+        """
+        tokens = []
+        for name, value in kwargs.items():
+            if value is False or value is None:
+                continue
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for single_value in values:
+                if single_value is False or single_value is None:
+                    continue
+                if len(name) == 1:
+                    tokens.append("-%s" % name)
+                else:
+                    tokens.append("--%s" % dashify(name))
+        return tokens
+
+    @classmethod
     def check_unsafe_options(cls, options: List[str], unsafe_options: List[str]) -> None:
         """Check for unsafe options.
 
         Some options that are passed to ``git <command>`` can be used to execute
         arbitrary commands. These are blocked by default.
+
+        ``options`` must be the final argv-style option tokens (see
+        :meth:`_tokenize_multi_options` and :meth:`_kwarg_option_tokens`), i.e. the same
+        representation that is actually passed to the git process. Checking any other
+        representation would let an option hidden inside a combined string, or a
+        keyword argument written with underscores, bypass the check.
+
+        Positional arguments such as URLs, paths and refspecs are never part of
+        ``options`` and are therefore not scanned here.
         """
-        # Options can be of the form `foo`, `--foo bar`, or `--foo=bar`, so we need to
-        # check if they start with "--foo" or if they are equal to "foo".
+        # Options can be of the form `--foo`, `--foo=bar`, or `foo`, so we check if
+        # they start with "--foo"/"-f" or are equal to the bare option name.
         bare_unsafe_options = [option.lstrip("-") for option in unsafe_options]
         for option in options:
             for unsafe_option, bare_option in zip(unsafe_options, bare_unsafe_options):
