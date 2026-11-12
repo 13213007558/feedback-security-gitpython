@@ -435,18 +435,126 @@ class _CatFileContentStream:
     ensure the underlying stream continues to work.
     """
 
-    __slots__ = ("_stream", "_nbr", "_size")
+    __slots__ = ("_stream", "_nbr", "_size", "_truncated", "_owner", "_attr_name", "_cmd")
 
-    def __init__(self, size: int, stream: IO[bytes]) -> None:
+    def __init__(
+        self,
+        size: int,
+        stream: IO[bytes],
+        owner: Optional["Git"] = None,
+        attr_name: Optional[str] = None,
+        cmd: Optional["Git.AutoInterrupt"] = None,
+    ) -> None:
         self._stream = stream
         self._size = size
         self._nbr = 0  # Number of bytes read.
+        self._truncated = False  # Set if the object body ended before ``size`` bytes.
+        # Information needed to rebuild the persistent process if framing is lost.
+        self._owner = owner
+        self._attr_name = attr_name
+        self._cmd = cmd
 
         # Special case: If the object is empty, has null bytes, get the final
         # newline right away.
         if size == 0:
-            stream.read(1)
+            self._consume_terminator()
         # END handle empty streams
+
+    def _consume_terminator(self) -> None:
+        """Consume the single trailing newline that terminates a cat-file object body.
+
+        EOF here means the child vanished before framing completed; remember that so the
+        caller can rebuild the persistent process instead of treating stale bytes as the
+        next object.
+        """
+        try:
+            terminator = self._stream.read(1)
+        except (OSError, ValueError):
+            terminator = b""
+        if terminator == b"":
+            self._truncated = True
+            self._invalidate_persistent_cmd()
+
+    def _check_truncation(self, data: bytes) -> None:
+        if data == b"" and self._nbr < self._size:
+            # A short read with bytes still expected means the underlying pipe ended,
+            # i.e. the cat-file process is no longer producing framed output.
+            self._truncated = True
+            self._invalidate_persistent_cmd()
+
+    def _invalidate_persistent_cmd(self) -> None:
+        """Detach the owning persistent process so it is rebuilt for the next call.
+
+        We cannot reliably find the boundary of the half-delivered object body, therefore
+        the process must not be reused: its next bytes would be a tail, not a new object.
+        """
+        owner = self._owner
+        if owner is None or self._attr_name is None or self._cmd is None:
+            return
+        owner._drop_persistent_cmd(self._attr_name, self._cmd)
+        # Avoid repeated teardown attempts from further reads.
+        self._owner = None
+        self._cmd = None
+
+    def check_complete(self) -> None:
+        """Raise if the full object body could not be read from the child.
+
+        Callers that must distinguish a genuine empty object from a process that died
+        mid-body can use this. The persistent process has already been rebuilt, so the
+        next request starts from a synchronized stream.
+        """
+        if self._truncated:
+            raise ValueError(
+                "cat-file object stream ended before the declared size was read; "
+                "the persistent cat-file process has been restarted"
+            )
+
+    def _read_exact(self, count: int) -> bytes:
+        """Read exactly ``count`` bytes, looping over short pipe reads.
+
+        A single ``read(n)`` on an OS pipe may return fewer than ``n`` bytes even when
+        more data is on the way. Treating such a short read as the whole body would leave
+        the terminating newline (or part of the body) in the shared stream and desync the
+        next object, so keep reading until either ``count`` bytes arrive or the pipe ends.
+        Returns fewer than ``count`` bytes only on EOF/error.
+        """
+        parts = []
+        remaining = count
+        while remaining > 0:
+            try:
+                chunk = self._stream.read(remaining)
+            except (OSError, ValueError):
+                chunk = b""
+            if not chunk:
+                break
+            parts.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(parts)
+
+    def drain_remaining(self) -> None:
+        """Synchronously consume any unread body bytes plus the terminating newline.
+
+        This is what makes the shared batch stream safe to reuse after a caller only read
+        part of an object. It cannot rely on :meth:`__del__`, which only runs during
+        garbage collection and therefore may not have happened when the next request is
+        issued. Short pipe reads are looped over so framing is always fully restored.
+        """
+        bytes_left = self._size - self._nbr
+        if bytes_left <= 0:
+            self._detach_from_owner()
+            return
+        drained = self._read_exact(bytes_left + 1)
+        self._nbr = self._size
+        if len(drained) < bytes_left + 1:
+            self._truncated = True
+            self._invalidate_persistent_cmd()
+        self._detach_from_owner()
+
+    def _detach_from_owner(self) -> None:
+        """Remove this stream from its owner so a fully consumed body is never redrained."""
+        owner = self._owner
+        if owner is not None and getattr(owner, "_cat_file_stream", None) is self:
+            owner._cat_file_stream = None
 
     def read(self, size: int = -1) -> bytes:
         bytes_left = self._size - self._nbr
@@ -459,13 +567,17 @@ class _CatFileContentStream:
             # They try to read all, make sure it's not more than what remains.
             size = bytes_left
         # END check early depletion
-        data = self._stream.read(size)
+        try:
+            data = self._stream.read(size)
+        except (OSError, ValueError):
+            data = b""
         self._nbr += len(data)
+        self._check_truncation(data)
 
         # Check for depletion, read our final byte to make the stream usable by
         # others.
         if self._size - self._nbr == 0:
-            self._stream.read(1)  # final newline
+            self._consume_terminator()
         # END finish reading
         return data
 
@@ -481,12 +593,16 @@ class _CatFileContentStream:
             size = bytes_left
         # END handle size
 
-        data = self._stream.readline(size)
+        try:
+            data = self._stream.readline(size)
+        except (OSError, ValueError):
+            data = b""
         self._nbr += len(data)
+        self._check_truncation(data)
 
         # Handle final byte.
         if self._size - self._nbr == 0:
-            self._stream.read(1)
+            self._consume_terminator()
         # END finish reading
 
         return data
@@ -525,11 +641,13 @@ class _CatFileContentStream:
     next = __next__
 
     def __del__(self) -> None:
-        bytes_left = self._size - self._nbr
-        if bytes_left:
-            # Read and discard - seeking is impossible within a stream.
-            # This includes any terminating newline.
-            self._stream.read(bytes_left + 1)
+        if self._size - self._nbr:
+            # Read and discard - seeking is impossible within a stream. Never raise out
+            # of finalization: if the child died, the persistent process is just rebuilt.
+            try:
+                self.drain_remaining()
+            except (OSError, ValueError):
+                pass
         # END handle incomplete read
 
 
@@ -629,6 +747,7 @@ class Git(metaclass=_GitMeta):
         "_working_dir",
         "cat_file_all",
         "cat_file_header",
+        "_cat_file_stream",
         "_version_info",
         "_version_info_token",
         "_git_options",
@@ -639,6 +758,7 @@ class Git(metaclass=_GitMeta):
     _excluded_ = (
         "cat_file_all",
         "cat_file_header",
+        "_cat_file_stream",
         "_version_info",
         "_version_info_token",
     )
@@ -985,6 +1105,9 @@ class Git(metaclass=_GitMeta):
         # Cached command slots
         self.cat_file_header: Union[None, TBD] = None
         self.cat_file_all: Union[None, TBD] = None
+        # The most recent content stream handed out by cat_file_all, so its unread body
+        # can be drained synchronously before the next request reuses the batch process.
+        self._cat_file_stream: Union[None, "_CatFileContentStream"] = None
 
     def __getattribute__(self, name: str) -> Any:
         if name == "USE_SHELL":
@@ -1646,6 +1769,18 @@ class Git(metaclass=_GitMeta):
             raise ValueError("Failed to parse header: %r" % header_line)
         return (tokens[0], tokens[1], int(tokens[2]))
 
+    def _is_missing_object_header(self, header_line: str) -> bool:
+        """Whether a non-object header is the in-sync ``missing`` response.
+
+        ``git cat-file --batch`` answers an unresolvable revision with a line ending in
+        ``missing`` instead of the usual three-token object header. For a non-hex input
+        this is the two-token form ``<input> missing``; for a 40-character hex string git
+        keeps the hex and emits ``<hex> missing``. Either way no object body follows, so
+        the batch stream stays synchronized and the process can serve the next request.
+        """
+        tokens = header_line.split()
+        return bool(tokens) and tokens[-1] in ("missing", b"missing")
+
     def _prepare_ref(self, ref: AnyStr) -> bytes:
         # Required for command to separate refs on stdin, as bytes.
         if isinstance(ref, bytes):
@@ -1656,6 +1791,21 @@ class Git(metaclass=_GitMeta):
         else:
             refstr = ref
 
+        # A persistent `git cat-file --batch[[-check]]` process consumes one request per
+        # input line. Newlines and NUL bytes are never part of a valid revision, so reject
+        # them before anything is written to stdin: otherwise a single caller-supplied
+        # revision could smuggle additional batch requests (e.g. ``"sha\nevil"``) and put
+        # the request/response stream out of sync for every subsequent call. A single
+        # trailing newline is the harmless line terminator and still yields one request.
+        single_trailing_newline = refstr.endswith("\n") and not refstr.endswith("\n\n")
+        request_body = refstr[:-1] if single_trailing_newline else refstr
+        if "\n" in request_body or "\r" in request_body or "\0" in request_body:
+            raise ValueError(
+                "Refusing to send revision containing a newline or NUL byte to the "
+                "persistent cat-file process, as it would split one revision into "
+                f"multiple batch requests: {refstr!r}"
+            )
+
         if not refstr.endswith("\n"):
             refstr += "\n"
         return refstr.encode(defenc)
@@ -1663,7 +1813,12 @@ class Git(metaclass=_GitMeta):
     def _get_persistent_cmd(self, attr_name: str, cmd_name: str, *args: Any, **kwargs: Any) -> "Git.AutoInterrupt":
         cur_val = getattr(self, attr_name)
         if cur_val is not None:
-            return cur_val
+            # A process that already exited can never answer another request, and reading
+            # its closed pipes would surface stale bytes. Drop it so a fresh one is spawned.
+            if self._persistent_cmd_is_dead(cur_val):
+                self._drop_persistent_cmd(attr_name, cur_val)
+            else:
+                return cur_val
 
         options = {"istream": PIPE, "as_process": True}
         options.update(kwargs)
@@ -1673,13 +1828,73 @@ class Git(metaclass=_GitMeta):
         cmd = cast("Git.AutoInterrupt", cmd)
         return cmd
 
-    def __get_object_header(self, cmd: "Git.AutoInterrupt", ref: AnyStr) -> Tuple[str, str, int]:
-        if cmd.stdin and cmd.stdout:
-            cmd.stdin.write(self._prepare_ref(ref))
-            cmd.stdin.flush()
-            return self._parse_object_header(cmd.stdout.readline())
-        else:
+    @staticmethod
+    def _persistent_cmd_is_dead(cmd: "Git.AutoInterrupt") -> bool:
+        """:return: ``True`` if the wrapped cat-file process has already terminated."""
+        proc = getattr(cmd, "proc", None)
+        if proc is None:
+            return True
+        try:
+            return proc.poll() is not None
+        except OSError:
+            return True
+
+    def _drop_persistent_cmd(self, attr_name: str, cmd: "Git.AutoInterrupt") -> None:
+        """Tear down a persistent process and detach it from the cache.
+
+        Used whenever request/response synchronization can no longer be trusted, so a
+        later call spawns a brand-new process instead of reusing a corrupted stream.
+        """
+        if getattr(self, attr_name, None) is cmd:
+            setattr(self, attr_name, None)
+        try:
+            cmd._terminate()
+        except OSError as ex:
+            _logger.info("Ignored error while tearing down persistent cat-file process: %r", ex)
+
+    def __get_object_header(
+        self, attr_name: str, cmd: "Git.AutoInterrupt", ref: AnyStr
+    ) -> Tuple[str, str, int]:
+        # Validate the revision before touching stdin, so a rejected revision never
+        # produces a half-written request on the shared batch stream.
+        request = self._prepare_ref(ref)
+        if not cmd.stdin or not cmd.stdout:
             raise ValueError("cmd stdin was empty")
+
+        try:
+            cmd.stdin.write(request)
+            cmd.stdin.flush()
+            header_line = cmd.stdout.readline()
+        except (OSError, ValueError) as ex:
+            # Broken/closed pipe means the child died mid-protocol; its remaining output
+            # (if any) is meaningless. Rebuild the process before reporting the failure.
+            self._drop_persistent_cmd(attr_name, cmd)
+            raise ValueError(
+                f"Persistent cat-file process failed while resolving revision {ref!r}; "
+                "the process has been restarted"
+            ) from ex
+
+        # An empty line signals EOF: the child exited without answering. The stream holds
+        # no further responses, but the cached process must still be replaced.
+        if header_line in ("", b""):
+            self._drop_persistent_cmd(attr_name, cmd)
+            raise ValueError(
+                f"Persistent cat-file process exited without answering revision {ref!r}; "
+                "the process has been restarted"
+            )
+
+        if self._is_missing_object_header(header_line):
+            # In-sync "missing" response: no object body follows, so the process stays
+            # usable for the next request.
+            raise ValueError("SHA could not be resolved, git returned: %r" % header_line.strip())
+
+        try:
+            return self._parse_object_header(header_line)
+        except ValueError:
+            # Any other framing error means we can no longer tell where this response
+            # (and its object body) ends, so the tail must never be read as a new object.
+            self._drop_persistent_cmd(attr_name, cmd)
+            raise
 
     def get_object_header(self, ref: str) -> Tuple[str, str, int]:
         """Use this method to quickly examine the type and size of the object behind the
@@ -1693,7 +1908,7 @@ class Git(metaclass=_GitMeta):
             (hexsha, type_string, size_as_int)
         """
         cmd = self._get_persistent_cmd("cat_file_header", "cat_file", batch_check=True)
-        return self.__get_object_header(cmd, ref)
+        return self.__get_object_header("cat_file_header", cmd, ref)
 
     def get_object_data(self, ref: str) -> Tuple[str, str, int, bytes]:
         """Similar to :meth:`get_object_header`, but returns object data as well.
@@ -1706,6 +1921,7 @@ class Git(metaclass=_GitMeta):
         """
         hexsha, typename, size, stream = self.stream_object_data(ref)
         data = stream.read(size)
+        stream.check_complete()
         del stream
         return (hexsha, typename, size, data)
 
@@ -1719,10 +1935,35 @@ class Git(metaclass=_GitMeta):
             This method is not threadsafe. You need one independent :class:`Git`
             instance per thread to be safe!
         """
+        # Restore framing first: if the caller abandoned a previous object after reading
+        # only part of it, consume the rest of its body (and terminator) before sending a
+        # new request. This must not wait for garbage collection of the old stream.
+        self._drain_active_cat_file_stream()
         cmd = self._get_persistent_cmd("cat_file_all", "cat_file", batch=True)
-        hexsha, typename, size = self.__get_object_header(cmd, ref)
+        hexsha, typename, size = self.__get_object_header("cat_file_all", cmd, ref)
         cmd_stdout = cmd.stdout if cmd.stdout is not None else io.BytesIO()
-        return (hexsha, typename, size, self.CatFileContentStream(size, cmd_stdout))
+        stream = self.CatFileContentStream(size, cmd_stdout, owner=self, attr_name="cat_file_all", cmd=cmd)
+        self._cat_file_stream = stream
+        return (hexsha, typename, size, stream)
+
+    def _drain_active_cat_file_stream(self) -> None:
+        """Drain the body of the stream returned by the previous batch request.
+
+        Persistent ``cat-file`` framing only stays synchronized if each object body is
+        fully consumed before the next header request. Callers are allowed to stop reading
+        early and discard the stream, so the owner remembers the active stream and drains
+        it here, synchronously, rather than relying on the stream's finalizer.
+        """
+        stream = self._cat_file_stream
+        if stream is None:
+            return
+        self._cat_file_stream = None
+        try:
+            stream.drain_remaining()
+        except (OSError, ValueError):
+            # The underlying pipe is unusable; mark truncated so the process is rebuilt.
+            stream._truncated = True
+            stream._invalidate_persistent_cmd()
 
     def clear_cache(self) -> "Git":
         """Clear all kinds of internal caches to release resources.
@@ -1732,6 +1973,7 @@ class Git(metaclass=_GitMeta):
         :return:
             self
         """
+        self._cat_file_stream = None
         for cmd in (self.cat_file_all, self.cat_file_header):
             if cmd:
                 cmd.__del__()

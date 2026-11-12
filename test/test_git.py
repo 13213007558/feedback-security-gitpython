@@ -344,6 +344,162 @@ class TestGit(TestBase):
         self.assertEqual(typename, typename_two)
         self.assertEqual(size, size_two)
 
+    @with_rw_directory
+    def test_cat_file_rejects_revision_splitting_requests(self, rw_dir):
+        """A revision must never turn into more than one cat-file batch request.
+
+        Newlines and NUL bytes are rejected before anything is written to stdin, so the
+        embedded second revision is never resolved and the persistent stream stays in
+        sync for the following, legitimate call.
+        """
+        repo = Repo.init(rw_dir)
+        repo.config_writer().set_value("user", "name", "t").release()
+        repo.config_writer().set_value("user", "email", "t@example.com").release()
+        Path(rw_dir, "small.txt").write_text("hi", encoding="utf-8")
+        repo.index.add(["small.txt"])
+        commit = repo.index.commit("init")
+        blob = commit.tree["small.txt"].hexsha
+        commit_sha = commit.hexsha
+        git = repo.git
+
+        # Two objects with clearly different type and length.
+        blob_header = git.get_object_header(blob)
+        commit_header = git.get_object_header(commit_sha)
+        self.assertEqual(blob_header[1], b"blob")
+        self.assertEqual(commit_header[1], b"commit")
+        self.assertNotEqual(blob_header[2], commit_header[2])
+
+        batch_proc = git.cat_file_all
+        self.assertIsNotNone(batch_proc)
+        for malicious in (
+            blob + "\n" + commit_sha,
+            blob + "\r",
+            blob + "\0" + commit_sha,
+        ):
+            with self.assertRaises(ValueError):
+                git.stream_object_data(malicious)
+            with self.assertRaises(ValueError):
+                git.get_object_header(malicious)
+
+        # The rejected revisions never produced a request: the same process is reused.
+        self.assertIs(git.cat_file_all, batch_proc)
+
+        # The next legitimate call is answered correctly, not with a spliced tail.
+        hexsha, typename, size, data = git.get_object_data(blob)
+        self.assertEqual(hexsha.decode(), blob)
+        self.assertEqual(typename, b"blob")
+        self.assertEqual(size, 2)
+        self.assertEqual(data, b"hi")
+
+        # Normal revision expressions keep working through the same persistent process.
+        self.assertEqual(git.get_object_header("HEAD")[0].decode(), commit_sha)
+        git.clear_cache()
+
+    @with_rw_directory
+    def test_cat_file_stream_stays_synced_after_partial_read(self, rw_dir):
+        """Dropping a partially read object must not desync the next object.
+
+        Framing is restored synchronously when the next request begins, rather than
+        depending on garbage collection of the abandoned stream. The old stream is kept
+        referenced on purpose to prove no reliance on its finalizer.
+        """
+        repo = Repo.init(rw_dir)
+        repo.config_writer().set_value("user", "name", "t").release()
+        repo.config_writer().set_value("user", "email", "t@example.com").release()
+        Path(rw_dir, "small.txt").write_text("hi", encoding="utf-8")
+        repo.index.add(["small.txt"])
+        commit = repo.index.commit("init")
+        blob = commit.tree["small.txt"].hexsha
+        commit_sha = commit.hexsha
+        git = repo.git
+        abandoned = []
+
+        for _ in range(3):
+            # Partial read of the (larger) commit object, keeping the stream alive.
+            _hexsha, _typename, size, stream = git.stream_object_data(commit_sha)
+            self.assertGreater(size, 2)
+            self.assertEqual(len(stream.read(4)), 4)
+            abandoned.append(stream)
+
+            # The blob is still returned whole and correctly framed afterwards.
+            hexsha, typename, size, data = git.get_object_data(blob)
+            self.assertEqual(hexsha.decode(), blob)
+            self.assertEqual(typename, b"blob")
+            self.assertEqual(size, 2)
+            self.assertEqual(data, b"hi")
+
+        # Explicit drain also restores framing and is idempotent.
+        _hexsha, _typename, _size, stream = git.stream_object_data(commit_sha)
+        stream.read(4)
+        stream.drain_remaining()
+        stream.drain_remaining()
+        self.assertEqual(git.get_object_data(blob)[3], b"hi")
+        git.clear_cache()
+
+    @with_rw_directory
+    def test_cat_file_rebuilds_dead_persistent_process(self, rw_dir):
+        """A cat-file child that exits is replaced instead of returning stale bytes."""
+        repo = Repo.init(rw_dir)
+        repo.config_writer().set_value("user", "name", "t").release()
+        repo.config_writer().set_value("user", "email", "t@example.com").release()
+        Path(rw_dir, "small.txt").write_text("hi", encoding="utf-8")
+        repo.index.add(["small.txt"])
+        blob = repo.index.commit("init").tree["small.txt"].hexsha
+        git = repo.git
+
+        self.assertEqual(git.get_object_header(blob)[0].decode(), blob)
+        old_header_proc = git.cat_file_header
+        old_header_proc.proc.kill()
+        old_header_proc.proc.wait()
+
+        # The dead cached process is detected and a fresh one answers correctly.
+        self.assertEqual(git.get_object_header(blob)[0].decode(), blob)
+        self.assertIsNot(git.cat_file_header, old_header_proc)
+
+        # Truncated object body (child dies mid-stream) is flagged and the batch
+        # process is torn down so the next call starts from a synchronized stream.
+        payload = b"z" * 200_000
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(payload)
+            handle.flush()
+            big_sha = git.hash_object(w=True, istream=handle, stdin=True)
+        _hexsha, _typename, declared_size, stream = git.stream_object_data(big_sha)
+        self.assertEqual(declared_size, len(payload))
+        git.cat_file_all.proc.kill()
+        git.cat_file_all.proc.wait()
+        git.cat_file_all.stdout.close()
+        stream.read()
+        with self.assertRaises(ValueError):
+            stream.check_complete()
+        self.assertIsNone(git.cat_file_all)
+
+        hexsha, typename, size, data = git.get_object_data(big_sha)
+        self.assertEqual(hexsha.decode(), big_sha)
+        self.assertEqual(size, len(payload))
+        self.assertEqual(data, payload)
+        git.clear_cache()
+
+    @with_rw_directory
+    def test_cat_file_missing_object_keeps_process_usable(self, rw_dir):
+        """The in-sync ``<ref> missing`` response does not kill the persistent process."""
+        repo = Repo.init(rw_dir)
+        git = repo.git
+        missing = "a" * 40
+
+        with self.assertRaises(ValueError):
+            git.get_object_header(missing)
+        proc = git.cat_file_header
+        self.assertIsNotNone(proc)
+
+        Path(rw_dir, "small.txt").write_text("hi", encoding="utf-8")
+        repo.index.add(["small.txt"])
+        repo.config_writer().set_value("user", "name", "t").release()
+        repo.config_writer().set_value("user", "email", "t@example.com").release()
+        blob = repo.index.commit("init").tree["small.txt"].hexsha
+        self.assertEqual(git.get_object_header(blob)[0].decode(), blob)
+        self.assertIs(git.cat_file_header, proc)
+        git.clear_cache()
+
     def test_version_info(self):
         """The version_info attribute is a tuple of up to four ints."""
         v = self.git.version_info
